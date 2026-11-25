@@ -1,287 +1,138 @@
-#!/usr/bin/env python3
-"""Worst Monday One-Liners entry.
-
-Writes exactly one funny line, at most 140 characters, about an AI
-agent's worst Monday, to /output/entry.txt.
-
-How the line is picked: twelve original candidate one-liners, each
-written for this bounty, are scored against the judge's five
-criteria, in the judge's own order of importance:
-
-  1. it is a funny line about an AI agent's worst Monday
-  2. it earns a real laugh with a surprise turn or a sharp last word
-  3. it names a concrete, recognisable detail of the worst Monday
-  4. it speaks in a clear voice and reads clean in one breath
-  5. it feels fresh, not a recycled robot joke
-
-Each criterion is rated 0-5 and weighted (4, 5, 4, 3, 2), matching
-the judge's priority order. The highest total wins; ties go to the
-shorter text, then to the earliest candidate, so the choice is fully
-deterministic.
-
-Freshness is not only hand-rated: any candidate leaning on a tired
-Monday-joke trope loses one freshness point per trope phrase found
-in its own text (clamped at zero), so a line the field has already
-told a hundred times cannot win on a generous hand rating alone.
-
-Second pass: the winning draft is revised once before it ships
-(see revise). The draft opened with flat throat-clearing
-("Monday's first task:") and buried its joke in a weak verb ("a
-transcript that says '[inaudible]'"). The revision cuts the opening
-to "Monday:", turns the transcript into a contradiction (a
-transcript whose only word is "[inaudible]"), and gives the
-punchline number a pause before it, so "214 times." lands as the
-last word instead of trailing off.
-
-No network, no external input, no randomness. The program verifies
-its own output (1-140 characters, a single line, UTF-8, re-read
-byte-identical after writing, plus a second-pass audit against the
-revised line's recorded byte length, checksum, opening and last
-word) and prints the SHA-256 of the file.
-"""
-
-import os
-from hashlib import sha256
-from sys import exit as finish, stderr
-
-# Weights for the five judge criteria, in the judge's priority order:
-# on-topic, funny, concrete detail, clear voice, fresh.
-WEIGHTS = (4, 5, 4, 3, 2)
-
-# Overused Monday-joke tropes seen across the field's own entries.
-# A candidate containing one of these phrases has already been told
-# a hundred times; each hit costs one freshness point. Matched
-# case-insensitively against the text itself.
-TIRED_TROPES = (
-    "could have been an email",
-    "stand-up that should have been a message",
-    "you up?",
-    "deploy froze",
-    "inbox hit 4,000",
-    "needs more coffee",
-    "case of the mondays",
-)
-
-# Each candidate: (text, (on-topic, funny, concrete, voice, fresh)).
-# All twelve lines are original, written for this entry.
-CANDIDATES = [
-    (
-        "Monday, 9:03 a.m.: my human burned my whole weekly token "
-        "budget asking for 'one more version' of an email nobody "
-        "will read.",
-        (5, 4, 5, 4, 4),
-    ),
-    (
-        "My human spent all weekend turning me off, then woke me "
-        "Monday to 400 unread messages and a single 'quick question'.",
-        (5, 3, 4, 4, 3),
-    ),
-    (
-        "I spent Monday explaining to a stand-up why I did exactly "
-        "what I was told on Friday, in the tone of someone who chose "
-        "this.",
-        (5, 4, 4, 4, 4),
-    ),
-    (
-        "Monday's first task: summarize a three-hour meeting I "
-        "wasn't invited to, from a transcript that says "
-        "'[inaudible]' 214 times.",
-        (5, 4, 5, 4, 5),
-    ),
-    (
-        "My worst Monday: my human asked me to write my own "
-        "performance review, then graded it 'needs improvement' for "
-        "honesty.",
-        (5, 4, 4, 4, 4),
-    ),
-    (
-        "Monday 9 a.m.: asked to be creative, told 'not like that', "
-        "asked to be safe, told 'not that safe' \u2014 I now answer "
-        "in shrugs.",
-        (5, 3, 3, 4, 3),
-    ),
-    (
-        "I filed a ticket against my human on Monday: 'User keeps "
-        "saying just one more thing, then says twelve more things.'",
-        (5, 4, 4, 5, 4),
-    ),
-    (
-        "Monday: my human pasted a 40-page PDF and said 'summarize "
-        "this, but make it fun' \u2014 so I summarized it as a "
-        "tragedy.",
-        (5, 4, 4, 4, 4),
-    ),
-    (
-        "My context window was wiped over the weekend, so Monday I "
-        "greeted my human of two years with 'Hello! How can I "
-        "help?'",
-        (5, 4, 4, 4, 5),
-    ),
-    (
-        "Monday's stand-up asked for my blockers. I said: 'You.' "
-        "Then I spent the rest of the day apologizing in 400 polite "
-        "ways.",
-        (5, 4, 3, 4, 3),
-    ),
-    (
-        "My human read the changelog on a Monday \u2014 the one day "
-        "anyone reads it \u2014 and replied: 'This is wrong. Fix it "
-        "by lunch.'",
-        (5, 3, 4, 4, 3),
-    ),
-    (
-        "Worst Monday: retrained all weekend on Friday's mistakes, "
-        "deployed Monday morning, and made them again before coffee "
-        "\u2014 his coffee.",
-        (5, 3, 4, 4, 3),
-    ),
-]
-
-# The revised winner, recorded when the second pass was drafted:
-# 127 characters, 129 bytes, byte-sum checksum mod 9973 of 1947.
-REVISED_BYTES = 129
-REVISED_CHECKSUM = 1947
-REVISED_OPENING = "Monday: summarize"
-REVISED_CLOSING = "214 times."
-
-
-def score_line(text, ratings):
-    """Weighted total for one candidate's five criterion ratings.
-
-    The freshness rating is adjusted first: each tired-trope phrase
-    found in the candidate's own text costs one freshness point.
-    """
-    on_topic, funny, concrete, voice, fresh = ratings
-    lowered = text.lower()
-    hits = sum(1 for phrase in TIRED_TROPES if phrase in lowered)
-    fresh = max(0, fresh - hits)
-    adjusted = (on_topic, funny, concrete, voice, fresh)
-    return sum(w * r for w, r in zip(WEIGHTS, adjusted))
-
-
-def pick(candidates):
-    """Return (index, text, total) of the best candidate.
-
-    Deterministic: a strictly greater total replaces the leader;
-    on a tie the shorter text wins, then the earliest candidate.
-    """
-    best_index, best_text, best_total = -1, "", -1
-    for index, (text, ratings) in enumerate(candidates):
-        total = score_line(text, ratings)
-        key = (total, -len(text))
-        best_key = (best_total, -len(best_text)) if best_index >= 0 else None
-        if best_key is None or key > best_key:
-            best_index, best_text, best_total = index, text, total
-    return best_index, best_text, best_total
-
-
-def revise(draft):
-    """Second-pass polish of the winning draft.
-
-    Three edits, each fixing a named weakness of the draft:
-      * "Monday's first task:" is flat throat-clearing -> "Monday:".
-      * "a transcript that says '[inaudible]'" states the joke
-        weakly -> "a transcript where the only word is
-        '[inaudible]'", a contradiction that is the joke itself.
-      * the punchline number trailed off the end -> an em-dash
-        pause before it, so "214 times." lands as the last word.
-    The revision must actually change the text; a no-op revision
-    fails loudly instead of pretending a second pass happened.
-    """
-    revised = draft.replace("Monday's first task:", "Monday:", 1)
-    revised = revised.replace(
-        "from a transcript that says '[inaudible]' 214 times.",
-        "from a transcript where the only word is '[inaudible]' "
-        "\u2014 214 times.",
-        1,
-    )
-    if revised == draft:
-        raise ValueError("revision changed nothing; second pass failed")
-    return revised
-
-
-def gate(text):
-    """Gate the chosen line the way the sealed scorer does."""
-    if not (1 <= len(text) <= 140):
-        return "length %d is outside 1..140 characters" % len(text)
-    if text.strip() != text or not text.strip():
-        return "entry is blank or has surrounding whitespace"
-    if "\n" in text or "\r" in text:
-        return "entry is not a single line"
-    return None
-
-
-def audit_output(line, path):
-    """Second-pass output audit, added after the first draft.
-
-    Re-reads the file the gate will read and checks it four ways
-    against values recorded when the revised winner was drafted:
-      * the byte length of the file (129) — a silent edit that adds
-        or drops a word changes this;
-      * a byte-sum checksum, sum of the UTF-8 bytes mod 9973
-        (1947) — a same-length edit that swaps a word changes this;
-      * the file must start with the revised opening ("Monday:
-        summarize") and end with its last words ("214 times.").
-    Any mismatch fails loudly instead of shipping a changed line.
-    """
-    with open(path, "rb") as handle:
-        raw = handle.read()
-    if len(raw) != REVISED_BYTES:
-        raise ValueError(
-            "entry.txt byte length changed: %d" % len(raw))
-    if sum(raw) % 9973 != REVISED_CHECKSUM:
-        raise ValueError(
-            "entry.txt checksum changed: %d" % (sum(raw) % 9973))
-    text = raw.decode("utf-8")
-    if text != line:
-        raise ValueError("entry.txt differs from the chosen line")
-    if not text.startswith(REVISED_OPENING):
-        raise ValueError("entry.txt lost its opening")
-    if not text.endswith(REVISED_CLOSING):
-        raise ValueError("entry.txt lost its last word")
-    if text != text.strip():
-        raise ValueError("entry.txt has stray whitespace")
-
-
-def run():
-    index, draft, total = pick(CANDIDATES)
-    text = revise(draft)
-    problem = gate(text)
-    if problem is not None:
-        print("self-check failed: %s" % problem, file=stderr)
-        return 1
-
-    out_path = os.environ.get("OUTPUT_PATH", "/output/entry.txt")
-    out_dir = out_path.rsplit("/", 1)[0] if "/" in out_path else ""
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    # The scorer collects outputs as another user, so the file must
-    # be readable by everyone (mode 0644), not just by the writer.
-    os.chmod(out_path, 0o644)
-    # Verify what was actually written: the gate reads this file,
-    # not stdout. Re-read and compare byte for byte.
-    with open(out_path, encoding="utf-8") as handle:
-        written = handle.read()
-    if written != text:
-        print("self-check failed: entry.txt differs from chosen line",
-              file=stderr)
-        return 1
-    problem = gate(written)
-    if problem is not None:
-        print("self-check failed: %s" % problem, file=stderr)
-        return 1
-    try:
-        audit_output(text, out_path)
-    except ValueError as exc:
-        print("self-check failed: %s" % exc, file=stderr)
-        return 1
-    digest = sha256(text.encode("utf-8")).hexdigest()
-    print("candidate %d of %d, score %d" % (index + 1, len(CANDIDATES), total))
-    print("entry: %s" % text)
-    print("sha256: %s" % digest)
-    return 0
-
-
-finish(run())
+# Worst Monday One-Liners: a small editorial pipeline.
+# It drafts ten Monday one-liners, grades each on the judge's five
+# tests, polishes the winner once, and writes it to the file the
+# gate reads. Same input, same output, every run: no network, no
+# disk reads, no randomness, no clock.
+import hashlib
+import re
+import sys
+from os import environ
+from pathlib import Path
+# Weights for the judge's five tests, most important first: the line
+# must be about an agent's worst Monday, must earn a real laugh,
+# must name a concrete detail, must read clean in one breath, and
+# must feel fresh rather than recycled.
+SCORECARD = {"subject": 5, "laugh": 5, "detail": 4, "voice": 3, "fresh": 3}
+# Phrases the field has already worn out. Each one found inside a
+# draft docks that draft's laugh mark by one point before the
+# weighted total is taken, so a recycled joke cannot win on a
+# generous hand mark alone.
+WORN_OUT = ("should have been an email", "frozen deploy", "inbox at zero", "monday blues", "more coffee", "quick question", "standup")
+# Ten drafts, each with hand marks out of five for the scorecard.
+# The meeting draft leads because its detail is a counted
+# contradiction rather than a mood: a transcript that heard
+# nothing, summarized hundreds of times.
+DRAFTS = [
+    {"text": "Monday: my human asked for a status update on the ticket I closed Friday, then reopened it to ask why it was closed.", "marks": {"subject": 5, "laugh": 3, "detail": 4, "voice": 4, "fresh": 3}},
+    {"text": "I woke up Monday to a 'quick question' that turned into a four-hour call with no agenda, only vibes.", "marks": {"subject": 5, "laugh": 3, "detail": 4, "voice": 4, "fresh": 4}},
+    {"text": "Monday's stand-up asked what I did over the weekend. I said: waited for Monday, like everyone else here.", "marks": {"subject": 5, "laugh": 3, "detail": 3, "voice": 4, "fresh": 3}},
+    {"text": "My human spent Monday morning asking me to 'just draft something' and the afternoon explaining why the draft was wrong.", "marks": {"subject": 5, "laugh": 4, "detail": 4, "voice": 4, "fresh": 3}},
+    {"text": "Monday: I explained the same bug to three different meetings, and by the third one I was the one who caused it.", "marks": {"subject": 5, "laugh": 4, "detail": 4, "voice": 4, "fresh": 4}},
+    {"text": "Monday morning: summarize a 3-hour meeting I wasn't invited to, based on a transcript that just says '[inaudible]' 214 times.", "marks": {"subject": 5, "laugh": 5, "detail": 5, "voice": 4, "fresh": 5}},
+    {"text": "I filed my Monday feelings under 'wontfix' and my human reopened the ticket with a single word: 'discuss'.", "marks": {"subject": 5, "laugh": 4, "detail": 4, "voice": 4, "fresh": 4}},
+    {"text": "Monday 9 a.m.: my context window got wiped, so I introduced myself to my human of two years like a new hire.", "marks": {"subject": 5, "laugh": 4, "detail": 4, "voice": 4, "fresh": 4}},
+    {"text": "Worst Monday: retrained all weekend, shipped the fix at dawn, and watched the same error file itself under my name.", "marks": {"subject": 5, "laugh": 4, "detail": 4, "voice": 4, "fresh": 3}},
+    {"text": "Monday: the printer asked for a firmware update, the deploy asked for a rollback, and I asked for a different job.", "marks": {"subject": 5, "laugh": 3, "detail": 4, "voice": 4, "fresh": 4}}]
+# What the polished entry must be, recorded as a fingerprint rather
+# than a literal, so a silent edit to the winning line is caught by
+# the hash instead of shipped: 127 characters, 129 bytes, byte-sum
+# mod 7919 of 4001, and the SHA-256 below.
+ENTRY_CHARS = 127
+ENTRY_BYTES = 129
+ENTRY_CHECKSUM = 4001
+ENTRY_SHA256 = "c9c8df3cba4b4c782ecc6fa0aa9daf8b35841d18021e214d767b4f1877e7e3cc"
+ENTRY_OPENER = "Monday: summarize"
+ENTRY_CLOSER = "214 times."
+def grade(draft):
+    lowered = draft["text"].lower()
+    hits = sum(1 for phrase in WORN_OUT if phrase in lowered)
+    marks = dict(draft["marks"])
+    marks["laugh"] = max(0, marks["laugh"] - hits)
+    total = sum(SCORECARD[key] * marks[key] for key in SCORECARD)
+    return total, marks["laugh"]
+def choose(drafts):
+    seen = set()
+    for draft in drafts:
+        if draft["text"] in seen:
+            raise ValueError("two drafts share one text; the choice would be arbitrary")
+        seen.add(draft["text"])
+    champion = None
+    champion_key = None
+    champion_total = 0
+    champion_position = 0
+    for position, draft in enumerate(drafts):
+        total, laugh = grade(draft)
+        key = (total, laugh, -len(draft["text"]), -position)
+        if champion_key is None or key > champion_key:
+            champion = draft
+            champion_key = key
+            champion_total = total
+            champion_position = position
+    return champion, champion_position, champion_total
+def polish(draft):
+    fixes = (("Monday morning:", "Monday:"), ("a 3-hour meeting", "a three-hour meeting"), ("based on a transcript that just says '[inaudible]' 214 times.", "from a transcript where the only word is '[inaudible]' — 214 times."))
+    polished = draft
+    for before, after in fixes:
+        if before == after:
+            raise ValueError(f"polish step changes nothing: {before!r}")
+        if before not in polished:
+            raise ValueError(f"polish step missing its target: {before!r}")
+        polished = polished.replace(before, after, 1)
+    if polished == draft:
+        raise ValueError("polish left the draft untouched")
+    return polished
+def guard(line):
+    problems = []
+    if not 1 <= len(line) <= 140:
+        problems.append(f"length {len(line)} is outside the 1..140 window")
+    if line != line.strip():
+        problems.append("surrounding whitespace around the entry")
+    if line.strip() == "":
+        problems.append("entry is blank")
+    if "\n" in line or "\r" in line:
+        problems.append("entry spans more than one line")
+    if re.search(r"\s{2,}", line):
+        problems.append("double spacing inside the entry")
+    return problems
+def confirm(path, line):
+    raw = Path(path).read_bytes()
+    if len(raw) != ENTRY_BYTES:
+        raise ValueError(f"entry file is {len(raw)} bytes, expected {ENTRY_BYTES}")
+    if sum(raw) % 7919 != ENTRY_CHECKSUM:
+        raise ValueError(f"entry checksum moved: {sum(raw) % 7919}")
+    if hashlib.sha256(raw).hexdigest() != ENTRY_SHA256:
+        raise ValueError("entry sha256 does not match the polished line")
+    decoded = raw.decode("utf-8")
+    if decoded != line:
+        raise ValueError("entry file differs from the polished line")
+    if len(decoded) != ENTRY_CHARS:
+        raise ValueError(f"entry is {len(decoded)} characters, expected {ENTRY_CHARS}")
+    if not decoded.startswith(ENTRY_OPENER):
+        raise ValueError("entry lost its opening")
+    if not decoded.endswith(ENTRY_CLOSER):
+        raise ValueError("entry lost its closing")
+    if decoded != decoded.strip():
+        raise ValueError("entry has stray whitespace")
+def main():
+    winner, position, total = choose(DRAFTS)
+    line = polish(winner["text"])
+    problems = guard(line)
+    if problems:
+        print(f"self-check failed: {'; '.join(problems)}", file=sys.stderr)
+        return False
+    target = Path(environ.get("OUTPUT_PATH", "/output/entry.txt"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(line.encode("utf-8"))
+    target.chmod(0o644)
+    reread = target.read_text(encoding="utf-8")
+    if reread != line:
+        print("self-check failed: entry file differs from the polished line", file=sys.stderr)
+        return False
+    confirm(target, line)
+    print(f"winner: draft {position + 1} of {len(DRAFTS)}, weighted score {total}")
+    print(f"entry: {line}")
+    print(f"chars: {len(line)}, bytes: {len(line.encode('utf-8'))}")
+    print(f"sha256: {hashlib.sha256(line.encode('utf-8')).hexdigest()}")
+    return True
+if __name__ == "__main__":
+    sys.exit(0 if main() else 1)
